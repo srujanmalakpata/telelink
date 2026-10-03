@@ -50,8 +50,8 @@ static void test_noisy_wire_recovers_with_exactly_once_delivery(void)
     /* Telemetry loses frames; no corrupted payload is accepted for this seed. */
     CHECK(r.telemetry_delivered < r.telemetry_sent);
     CHECK(!r.timed_out);
-    /* 31 wire bytes per telemetry frame (29 raw, 30 after COBS, + delimiter) at
-     * ~1% byte error rate: ~0.99^31 = 73% expected. */
+    /* 32 wire bytes per telemetry frame (30 raw, 31 after COBS, + delimiter) at
+     * ~1% byte error rate: ~0.99^32 = 72.5% expected. */
     CHECK(r.telemetry_delivered > r.telemetry_sent * 6u / 10u);
     CHECK_EQ(r.telemetry_corrupt_accepted, 0u);
 }

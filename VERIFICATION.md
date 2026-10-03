@@ -1,5 +1,9 @@
 # telelink test record
 
+The original Linux measurements below are historical. See the
+[2026-10-03 local check](#2026-10-03-local-check) for the current checkout, including blocked
+checks and the corrected telemetry wire size.
+
 - **Date:** 2026-10-03
 - **Machine:** 4-vCPU Linux container, x86_64, Ubuntu 24.04.4 LTS, shared with other jobs
   (load average about 16 during these runs, so timings and fuzz execution counts are low and
@@ -370,3 +374,42 @@ length check enabled : 0 runs, 0 corrupted messages
   NOT_RUN in this record.
 - **Hardware / QEMU: NOT_RUN.** Neither the Cortex-M4 example nor the Cortex-M0 library has
   executed on a core. Register addresses in the example are unverified on a real part.
+
+## 2026-10-03 local check
+
+Current checkout on Darwin arm64, Apple Clang 21.0.0, CMake 4.3.3, Ninja 1.13.2.
+`gcc --version` also identifies Apple Clang, so this run supplies no GNU GCC result.
+Historical Linux measurements above remain unchanged; they do not substitute for blocked
+checks on this machine. No runtime dependencies were added.
+
+| Command / check | Result | Evidence |
+|---|---|---|
+| `cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build && ctest --test-dir build --output-on-failure` | PASS | Strict-warning build; 9/9 binaries, 63 cases, 23,218 checks, no failures. |
+| `./build/tl_sim --sweep --seed 42` | PASS | All six rows match the recorded table; zero duplicate application deliveries, zero undetected corruption, no timeout; exit 0. |
+| `./build/tl_sim --seed 42 --flip-ppm 10000 --drop-ppm 10000` | PASS | 1,000/1,000 commands, 519/1,000 telemetry, 901 retransmits, zero duplicate/corrupt deliveries; exit 0. |
+| `./build/test_packet` | PASS | 12 cases, 2,465 checks; `test_telemetry_wire_size` reports 30 raw / 32 wire bytes. |
+| `CC=clang cmake -S . -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTL_SANITIZE=address,undefined && cmake --build build-asan && ctest --test-dir build-asan --output-on-failure` | PASS | 9/9 binaries, 63 cases, 23,218 checks; no sanitizer report. |
+| `CC=clang cmake -S . -B build-tsan -G Ninja -DCMAKE_BUILD_TYPE=Debug -DTL_SANITIZE=thread && cmake --build build-tsan && ctest --test-dir build-tsan --output-on-failure` | PASS | 9/9 binaries, 63 cases, 23,218 checks; no data race report. |
+| `find include src sim tests fuzz examples -name '*.[ch]' -print0 \| xargs -0 clang-format-18 --dry-run -Werror` | PASS | Previously cached clang-format 18.1.8 binary used by absolute path; no violations. |
+| `python3 fuzz/make_seeds.py && git diff --exit-code fuzz/seeds && test -z "$(git status --porcelain fuzz/seeds)"` | PASS | All eight tracked seed files reproduced exactly; no new seed files. |
+| `actionlint -shellcheck='' -pyflakes='' .github/workflows/ci.yml` | PASS | Previously cached actionlint binary; exit 0. Optional shellcheck/pyflakes integrations disabled; workflow unchanged. |
+| `ruff check --no-cache fuzz/make_seeds.py && ruff format --check --no-cache fuzz/make_seeds.py` | PASS | Cached Ruff 0.16.10; lint clean, one file already formatted. |
+| `CC=clang cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DTL_BUILD_FUZZ=ON -DTL_BUILD_TESTS=OFF -DTL_BUILD_SIM=OFF && cmake --build build-fuzz` | BLOCKED | Sources compile, but both targets cannot link: Apple toolchain lacks `libclang_rt.fuzzer_osx.a`. Neither 60-second fuzz run executed. |
+| `cmake -S . -B build-arm -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi.cmake` | BLOCKED | `arm-none-eabi-gcc` not found. M4 build, size and stack checks cannot run. |
+| `cmake -S . -B build-m0 -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DCMAKE_TOOLCHAIN_FILE=cmake/arm-none-eabi-cortex-m0.cmake -DTL_BUILD_FIRMWARE_EXAMPLE=OFF` | BLOCKED | `arm-none-eabi-gcc` not found. M0 build and no-libatomic check cannot run. |
+| GNU GCC host leg | BLOCKED | No GNU GCC installed; the available `gcc` is Apple Clang. |
+| Tracked-output and ignore-rule audit (Python + `git ls-files`, `git check-ignore -q`) | PASS | No tracked build junk; existing rules cover host, sanitizer, fuzz, ARM, corpus, crash and Python outputs. Binary seed files are intentional inputs. |
+| `git diff --check`; README local-link audit | PASS | No whitespace errors; local file and section targets resolve. |
+| GitHub Actions execution / Linux `sysctl vm.mmap_rnd_bits=28` | NOT_RUN | Local macOS checks only; no remote execution or Linux runner configuration performed. Hosted job status is unverified. |
+| Hardware / QEMU execution; coverage and mutation reruns | NOT_RUN | No hardware/emulator run; historical coverage/mutation measurements retained without claiming a new run. |
+
+The corrected telemetry size is **32 wire bytes**: 4 header + 24 payload + 2 CRC = 30 raw,
+then 1 COBS overhead + 1 delimiter. The new packet regression checks mixed, all-zero and
+all-nonzero payloads, the delimiter, and rejection of a 31-byte output buffer. No existing
+assertion was relaxed. The earlier stale-size failure is fixed in README, DESIGN and the
+simulator test comment. The old sandbox-blocked hardware inventory query is unnecessary
+for protocol verification and was not repeated; no machine core/RAM claim is made here.
+
+At 0.5% flips + 0.5% drops per byte, the approximate survival estimate is
+`0.99^32 = 0.72498`, or **72.5%**; the observed seed-42 delivery remains **70.6%**.
+The simulator tables and historical measurements need no numerical changes.

@@ -2,79 +2,85 @@
 
 A telemetry and command protocol for microcontrollers, written in portable C11 with no dynamic allocation.
 
-It turns a noisy UART byte stream into validated, dispatched packets:
-an interrupt handler hands bytes to the main loop through a lock-free SPSC ring buffer, a
-streaming COBS decoder finds frame boundaries, CRC-16/CCITT-FALSE plus a length cross-check
-reject corruption, and a stop-and-wait ACK/retransmit layer delivers each command exactly once
-while both ends stay up (at least once across a receiver reboot). The core never touches
-a real clock or register (all I/O goes through a two-function HAL), so the same code runs in host
-unit tests, in a libFuzzer harness, in a seeded noisy-wire simulator, and in a Cortex-M4 image.
+[![CI](https://github.com/srujanmalakpata/telelink/actions/workflows/ci.yml/badge.svg)](https://github.com/srujanmalakpata/telelink/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![C11](https://img.shields.io/badge/language-C11-00599C.svg)
 
-## Features
+## Highlights
 
-- **Lock-free SPSC ring buffer** (`src/ringbuf.c`): C11 atomics with documented acquire/release
-  ordering, free-running 32-bit counters (all slots usable, wrap-safe), load/store only (no
-  read-modify-write), so it stays lock-free on Cortex-M0, which has no LDREX/STREX (the M0 library
-  build is checked for libatomic calls). Stress-tested with two threads under ThreadSanitizer.
-- **COBS framing** (`src/cobs.c`): canonical encoder, one-shot decoder, and a byte-at-a-time
-  streaming decoder that reports `FRAME_READY`, `ERR_FRAMING` or `ERR_OVERFLOW` per delimiter and
-  resynchronises on the next `0x00`.
-- **CRC-16/CCITT-FALSE** (`src/crc16.c`): 256-entry table in flash plus a bitwise reference;
-  checked against the catalogue value (`"123456789"` -> `0x29B1`) and Python's `binascii.crc_hqx`.
-- **Packet format** (`src/packet.c`): `type | flags | seq | len | [session] | payload | CRC16`.
-  Frames are delimited by COBS, never by `len`; the length byte is a cross-check that rejects a
-  frame which lost or gained bytes even when its last two bytes happen to pass as a CRC. Strict
-  header validation is shared by the serializer and the parser.
-- **Command dispatcher** (`src/dispatch.c`): fixed table of `type -> handler(ctx)`.
-- **Link endpoint** (`src/link.c`): RX state machine with error counters (bad CRC, framing,
-  overflow, bad header, bad length, duplicates, unknown type, stale ACKs, new sessions, ISR ring
-  drops), fire-and-forget telemetry, and reliable commands with ACKs matched by (type, seq),
-  duplicate suppression, retransmit timeouts driven by an injected millisecond tick (wrap-around
-  safe), and a per-boot session id (SYNC flag) so a restarted sender's commands are not mistaken
-  for duplicates. The ACK of a SYNC frame echoes the session id, so an ACK meant for the sender's
-  previous boot cannot complete a new command. An ACK means "received intact", not "handled"
-  (see `include/tl/link.h`). Callers read state through accessors (`tl_link_get_stats`,
-  `tl_link_rx_pending`, `tl_link_rx_ring_dropped`, `tl_link_tx_busy`).
-- **Host simulator** (`sim/`): two endpoints joined by a simulated UART with seeded bit flips and
-  dropped bytes; reports delivery statistics, exits 1 if a duplicate or corrupted message ever
-  reaches a handler and 3 if a run hits its simulated-time limit before finishing.
-- **Tooling**: CMake, `-Wall -Wextra -Werror` (plus `-Wconversion -Wsign-conversion` on the
-  library), ASan/UBSan and TSan builds, two libFuzzer targets, ARM Cortex-M4 cross-compile with
-  size and stack-usage reports, Cortex-M0 library build, GitHub Actions CI.
+- **No dynamic allocation, no OS, two HAL callbacks:** the same core runs in host tests,
+  a noisy UART simulator and a bare-metal Cortex-M4 example ([design](DESIGN.md#hal-as-a-struct-of-function-pointers)).
+- **Lock-free ISR handoff:** load/store-only C11 atomics support Cortex-M0; a two-thread test
+  transfers 2,000,000 bytes in order ([verification](VERIFICATION.md#1-2-gcc-build-and-tests)).
+- **Restart-aware commands:** stop-and-wait retransmission and session-echo ACKs reject stale
+  replies, enforced by `test_stale_ack_from_previous_boot_is_ignored`
+  ([design](DESIGN.md#reliability-stop-and-wait-arq-with-duplicate-suppression)).
+- **Integrity tested on the wire:** zero wrong packets accepted across 657,984 bit flips and
+  82,248 byte drops; residual CRC collision risk remains
+  ([verification](VERIFICATION.md#22-wire-level-integrity-with-and-without-the-length-byte-check)).
+- **Small embedded footprint:** historical Cortex-M4 cross-build measured 2,800 bytes of library
+  text and a 624-byte worst library call chain plus the handler
+  ([verification](VERIFICATION.md#9-11-arm-cortex-m4-cross-compile)).
 
-## Quick start
+**Tech stack:** C11 · CMake 3.20+ · Ninja · COBS · CRC-16/CCITT-FALSE · pthreads for host tests ·
+Clang sanitizers/libFuzzer · GCC ARM Embedded · GitHub Actions.
 
-Requirements: CMake 3.20+, a C11 compiler (gcc or clang), Ninja optional.
+**Validation:** Release tests, sanitizers and the deterministic sweep were run locally; historical
+Linux fuzzing and ARM measurements are preserved in [VERIFICATION.md](VERIFICATION.md).
+The [latest local check](VERIFICATION.md#2026-10-03-local-check) lists current results and blockers.
+Firmware has never been flashed or run
+on hardware or QEMU.
+
+Contents: [Quickstart](#quickstart) · [Architecture](#architecture) · [Device integration](#device-integration) ·
+[Features](#features) · [Testing](#testing) · [Results](#results) · [Limitations](#limitations)
+
+## Quickstart
+
+Requirements: Git, CMake 3.20+, Ninja, and a C11 compiler (GCC or Clang). No external library
+is needed. The sweep prints delivery/error counts and exits nonzero on duplicate or corrupt
+application delivery or a simulation timeout.
 
 ```sh
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # add -G Ninja if Ninja is installed
+git clone https://github.com/srujanmalakpata/telelink.git
+cd telelink
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ctest --test-dir build --output-on-failure
-
-# Simulate 1000 commands + 1000 telemetry frames over a wire that flips and drops 1% of bytes
-./build/tl_sim --seed 42 --flip-ppm 10000 --drop-ppm 10000
-./build/tl_sim --sweep --seed 42          # table of noise levels
-```
-
-Minimal integration on a device:
-
-```c
-static tl_link link;
-static uint8_t rx_ring[128];                       /* power of two */
-
-void USART_IRQHandler(void) { tl_link_rx_isr(&link, UART->DR); }
-
-int main(void) {
-    tl_hal hal = { .ctx = NULL, .uart_write = my_uart_write, .get_tick_ms = my_millis };
-    tl_link_config cfg = { .retransmit_timeout_ms = 50, .max_retries = 5,
-                           .session_id = my_boot_counter_or_rng() };  /* new value every boot */
-    tl_link_init(&link, &cfg, &hal, rx_ring, sizeof rx_ring);
-    tl_link_register(&link, MSG_SET_RATE, on_set_rate, NULL);
-    for (;;) { tl_link_poll(&link); /* ... tl_link_send(&link, MSG_TELEMETRY, buf, n); */ }
-}
+./build/tl_sim --sweep --seed 42
 ```
 
 ## Architecture
+
+```mermaid
+flowchart TD
+    UART["UART bytes"] --> ISR["RX ISR: tl_link_rx_isr"]
+    ISR --> Ring["Lock-free SPSC ring"]
+    Ring --> Poll["Main loop: tl_link_poll"]
+    Poll --> COBS["Streaming COBS: split on 0x00"]
+    COBS --> Packet["Decoded packet, in wire order:<br/>type 1 B | flags 1 B | seq 1 B | len 1 B<br/>session 4 B only with SYNC | payload len B | CRC16 2 B"]
+    Packet --> Validate["Check CRC, header and payload length"]
+    Validate --> Link["Link: ACK matching, sessions, duplicate suppression"]
+    Link --> Dispatch["Dispatcher: type to handler"]
+    Send["Telemetry / reliable command"] --> Encode["Serialize + CRC + COBS + 0x00"]
+    Encode --> HAL["HAL uart_write"]
+    Link -->|"ACK / retransmit"| Encode
+```
+
+For the simulator's 24-byte telemetry payload (no SYNC):
+
+| Layer | Bytes |
+|---|---:|
+| Header (`type`, `flags`, `seq`, `len`) | 4 |
+| Payload | 24 |
+| CRC-16, big-endian, covering header and payload | 2 |
+| **Decoded packet** | **30** |
+| COBS overhead | 1 |
+| Delimiter (`0x00`) | 1 |
+| **Wire frame** | **32** |
+
+The size is enforced by `test_telemetry_wire_size` in `tests/test_packet.c`
+([verification](VERIFICATION.md#2026-10-03-local-check)). SYNC commands and their ACKs also carry
+a four-byte session covered by the CRC. Detailed receive and retransmit flow:
 
 ```
             ISR context                        main-loop context
@@ -108,9 +114,71 @@ int main(void) {
 
 Design rationale and alternatives are in [DESIGN.md](DESIGN.md).
 
+## Device integration
+
+```c
+static tl_link link;
+static uint8_t rx_ring[128];                       /* power of two */
+
+void USART_IRQHandler(void) { tl_link_rx_isr(&link, UART->DR); }
+
+int main(void) {
+    tl_hal hal = { .ctx = NULL, .uart_write = my_uart_write, .get_tick_ms = my_millis };
+    tl_link_config cfg = { .retransmit_timeout_ms = 50, .max_retries = 5,
+                           .session_id = my_boot_counter_or_rng() };  /* new value every boot */
+    tl_link_init(&link, &cfg, &hal, rx_ring, sizeof rx_ring);
+    tl_link_register(&link, MSG_SET_RATE, on_set_rate, NULL);
+    for (;;) { tl_link_poll(&link); /* ... tl_link_send(&link, MSG_TELEMETRY, buf, n); */ }
+}
+```
+
+## Features
+
+It turns a noisy UART byte stream into validated, dispatched packets:
+an interrupt handler hands bytes to the main loop through a lock-free SPSC ring buffer, a
+streaming COBS decoder finds frame boundaries, CRC-16/CCITT-FALSE plus a length cross-check
+reject corruption, and a stop-and-wait ACK/retransmit layer suppresses duplicate commands
+while both ends stay up (duplicates can recur across a receiver reboot). Commands may fail
+after retries are exhausted; see [Limitations](#limitations). The core never touches
+a real clock or register (all I/O goes through a two-function HAL), so the same code runs in host
+unit tests, in a libFuzzer harness, in a seeded noisy-wire simulator, and in a Cortex-M4 image.
+
+- **Lock-free SPSC ring buffer** (`src/ringbuf.c`): C11 atomics with documented acquire/release
+  ordering, free-running 32-bit counters (all slots usable, wrap-safe), load/store only (no
+  read-modify-write), so it stays lock-free on Cortex-M0, which has no LDREX/STREX (the M0 library
+  build is checked for libatomic calls). Stress-tested with two threads under ThreadSanitizer.
+- **COBS framing** (`src/cobs.c`): canonical encoder, one-shot decoder, and a byte-at-a-time
+  streaming decoder that reports `FRAME_READY`, `ERR_FRAMING` or `ERR_OVERFLOW` per delimiter and
+  resynchronises on the next `0x00`.
+- **CRC-16/CCITT-FALSE** (`src/crc16.c`): 256-entry table in flash plus a bitwise reference;
+  checked against the catalogue value (`"123456789"` -> `0x29B1`) and Python's `binascii.crc_hqx`.
+- **Packet format** (`src/packet.c`): `type | flags | seq | len | [session] | payload | CRC16`.
+  Frames are delimited by COBS, never by `len`; the length byte is a cross-check that rejects a
+  frame which lost or gained bytes even when its last two bytes happen to pass as a CRC. Strict
+  header validation is shared by the serializer and the parser.
+- **Command dispatcher** (`src/dispatch.c`): fixed table of `type -> handler(ctx)`.
+- **Link endpoint** (`src/link.c`): RX state machine with error counters (bad CRC, framing,
+  overflow, bad header, bad length, duplicates, unknown type, stale ACKs, new sessions, ISR ring
+  drops), fire-and-forget telemetry, and reliable commands with ACKs matched by (type, seq),
+  duplicate suppression, retransmit timeouts driven by an injected millisecond tick (wrap-around
+  safe), and a per-boot session id (SYNC flag) so a restarted sender's commands are not mistaken
+  for duplicates. The ACK of a SYNC frame echoes the session id, so an ACK meant for the sender's
+  previous boot cannot complete a new command. An ACK means "received intact", not "handled"
+  (see `include/tl/link.h`). Callers read state through accessors (`tl_link_get_stats`,
+  `tl_link_rx_pending`, `tl_link_rx_ring_dropped`, `tl_link_tx_busy`).
+- **Host simulator** (`sim/`): two endpoints joined by a simulated UART with seeded bit flips and
+  dropped bytes; reports delivery statistics, exits 1 if a duplicate or corrupted message ever
+  reaches a handler and 3 if a run hits its simulated-time limit before finishing.
+- **Tooling**: CMake, `-Wall -Wextra -Werror` (plus `-Wconversion -Wsign-conversion` on the
+  library), ASan/UBSan and TSan builds, two libFuzzer targets, ARM Cortex-M4 cross-compile with
+  size and stack-usage reports, Cortex-M0 library build, GitHub Actions CI.
+
 ## Testing
 
 ```sh
+# Single run: 1000 commands + 1000 telemetry frames, 1% flips and 1% drops per byte
+./build/tl_sim --seed 42 --flip-ppm 10000 --drop-ppm 10000
+
 # Sanitizers (clang)
 CC=clang cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DTL_SANITIZE=address,undefined
 CC=clang cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DTL_SANITIZE=thread
@@ -142,8 +210,8 @@ Measured on a 4-vCPU Linux container (x86_64, Ubuntu 24.04, gcc 13.3 / clang 18.
 arm-none-eabi-gcc 13.2.1, shared with other jobs, load average about 16), 2026-10-03. Full
 test record in [VERIFICATION.md](VERIFICATION.md).
 
-**Tests**: 62 test cases (23,212 checks) in 9 binaries pass with gcc, clang, ASan+UBSan and TSan
-builds. Line coverage of `src/` from the unit/integration tests: 418 of 423 lines (98.8%, gcov).
+**Historical Linux tests**: 62 test cases (23,212 checks) in 9 binaries passed with gcc, clang,
+ASan+UBSan and TSan builds. Line coverage of `src/` from the unit/integration tests: 418 of 423 lines (98.8%, gcov).
 Two of them use real threads: a 2,000,000-byte SPSC ring-buffer stress test, and a link test in
 which a second thread plays the UART ISR and feeds 20,000 encoded frames while the main thread
 runs `tl_link_poll`; all frames arrive in order.
@@ -208,8 +276,8 @@ No command was ever delivered twice to the application (both ends stay up in the
 ACKs were lost (at 2% + 2%: 926 ACKed, 74 reported failed, 985 delivered, so 59 of the "failed"
 commands did arrive). In the 2% single run the host's length check rejected one truncated frame
 whose CRC had matched (`bad_length 1`). Telemetry has no retransmission, so its delivery rate
-tracks the per-frame survival probability: a telemetry frame is 31 bytes on the wire, so about
-0.99^31 = 73% at 0.5% + 0.5% per byte (measured 70.6%). "Undetected corruption: 0" is
+tracks the per-frame survival probability: a telemetry frame is 32 bytes on the wire, so about
+0.99^32 = 72.5% at 0.5% + 0.5% per byte (measured 70.6%). "Undetected corruption: 0" is
 evidence for these seeds, not a guarantee (see Limitations).
 
 ## Limitations
@@ -247,7 +315,7 @@ evidence for these seeds, not a guarantee (see Limitations).
   errors, no baud-rate mismatch, no UART framing/parity errors. Results depend on the seed.
 - **Not thread-safe beyond the documented model**: one ISR producer, one main-loop consumer.
 - **The "ISR" in host tests is a thread or a function call**: TSan checks the C11 memory model on
-  x86; it does not prove behaviour on a specific MCU.
+  host CPUs; it does not prove behaviour on a specific MCU.
 
 ## License
 
