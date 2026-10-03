@@ -1,0 +1,39 @@
+# CMake build trees (host, sanitizer, fuzz, coverage, cross)
+build/
+build-*/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
+
+# Compiler / linker outputs
+*.o
+*.obj
+*.a
+*.elf
+*.bin.out
+*.map
+*.su
+*.gcno
+*.gcda
+*.gcov
+coverage/
+
+# libFuzzer outputs (seed corpus in fuzz/seeds/ IS committed)
+corpus_*/
+crash-*
+leak-*
+timeout-*
+oom-*
+fuzz-*.log
+
+# Python helpers
+__pycache__/
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.uv-cache/
