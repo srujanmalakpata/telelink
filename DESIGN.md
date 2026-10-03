@@ -5,8 +5,8 @@ This document describes the design constraints, protocol decisions, alternatives
 ## Goals and constraints
 
 - Runs on a small microcontroller: portable C11, no `malloc`, bounded stack, no OS.
-- Survives a noisy serial line: corrupted, dropped and inserted bytes must never crash the
-  receiver or reach the application as valid data.
+- Survives a noisy serial line: malformed input must never crash the receiver; CRC and length
+  checks reject corruption, subject to the residual CRC collision risk described below.
 - Testable on a laptop: no clock, register or blocking call inside the core.
 - Small, readable implementation.
 
@@ -124,8 +124,11 @@ after the CRC with the length that actually arrived. A corrupted length byte can
 the frame. In *length-prefixed framing*, that can desynchronise the stream; as a cross-check,
 the disagreement signals corruption. It turns the truncation case
 described under [Integrity](#integrity-crc-16ccitt-false-table-driven-plus-a-length-cross-check) from "caught with probability 1 - 2^-16" into "caught". The cost is one byte per
-frame (about 3% of a 31-byte telemetry frame). The extra byte changes the alignment of frames
-against the simulator's seeded noise stream, so a CRC-only format has different delivery counts.
+frame (1/32, about 3.1% of a 32-byte telemetry frame with a 24-byte payload). The wire size is
+4 header + 24 payload + 2 CRC + 1 COBS overhead + 1 delimiter = 32 bytes, checked by
+`test_telemetry_wire_size` in `tests/test_packet.c`. At 0.5% flips + 0.5% drops per byte, the
+approximate frame survival is 0.99^32 = 72.5% (seed-42 delivery: 70.6%). The extra byte changes
+the alignment of frames against the simulator's seeded noise stream, so a CRC-only format has different delivery counts.
 
 The 4-byte `session` field is present only when the SYNC flag is set (see [Reliability](#reliability-stop-and-wait-arq-with-duplicate-suppression)). Header checks
 run after the CRC: type 0 is reserved, reserved flag bits must be zero, an ACK cannot be

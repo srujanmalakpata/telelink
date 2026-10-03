@@ -246,6 +246,24 @@ static void test_frame_encode_has_single_delimiter(void)
     CHECK_EQ(tl_frame_encode(&p, wire, 10), 0u);
 }
 
+/* Simulator telemetry: four header bytes + 24 payload bytes + two CRC bytes,
+ * then one COBS overhead byte and the delimiter, independent of payload zeros. */
+static void test_telemetry_wire_size(void)
+{
+    tl_packet p = make_packet(0x20, 0, 1, 24);
+    uint8_t raw[TL_MAX_RAW];
+    uint8_t wire[32];
+    CHECK_EQ(tl_packet_serialize(&p, raw, sizeof raw), 30u);
+    CHECK_EQ(tl_frame_encode(&p, wire, sizeof wire), 32u);
+    CHECK_EQ(wire[31], 0u);
+    CHECK_EQ(tl_frame_encode(&p, wire, sizeof wire - 1u), 0u);
+    memset(p.payload, 0, p.len);
+    CHECK_EQ(tl_frame_encode(&p, wire, sizeof wire), 32u);
+    memset(p.payload, 0xFF, p.len);
+    CHECK_EQ(tl_frame_encode(&p, wire, sizeof wire), 32u);
+    printf("  telemetry: 30 raw bytes, 32 wire bytes (24-byte payload)\n");
+}
+
 /* ---- Wire-level single bit flips (what a noisy UART actually does). */
 
 static uint32_t xorshift32(uint32_t *state)
@@ -393,6 +411,7 @@ int main(void)
     RUN_TEST(test_crc_catches_every_single_bit_flip);
     RUN_TEST(test_parse_length_and_header_errors);
     RUN_TEST(test_frame_encode_has_single_delimiter);
+    RUN_TEST(test_telemetry_wire_size);
     RUN_TEST(test_sync_frame_carries_session);
     RUN_TEST(test_sync_header_rules);
     RUN_TEST(test_parse_rejects_oversized_payload_without_session);
